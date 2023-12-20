@@ -190,8 +190,6 @@ static __inline int do_filter(struct __sk_buff *skb, uint32_t mode)
             // Print MAC address
 	    /* TODO: Add code here that prints MAC Address of packet 
 	     * and the target MAC address in a:b:c:d:e:f format */
-            // Solution 
-	    // bpf_trace_printk("%x:%x:%x", sizeof(src_fmt), iface_mac[0],iface_mac[1], iface_mac[2] )
 	    bpf_trace_printk(src_fmt, sizeof(src_fmt),
                              (iface_mac[0] << 16 | iface_mac[1] << 8 | iface_mac[2]),
                              (iface_mac[3] << 16 | iface_mac[4] << 8 | iface_mac[5]));
