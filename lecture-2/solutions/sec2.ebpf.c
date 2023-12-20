@@ -19,7 +19,6 @@ struct {
 SEC("xdp-pass")
 int  xdp_allow(struct xdp_md *ctx)
 {
-
 	__u64 bytes =  (__u64) (ctx->data_end - ctx->data); 
 	__u32 key = 0; //We have only one element.
 	struct stats *s = bpf_map_lookup_elem(&pkt_cnt, &key);
