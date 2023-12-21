@@ -31,7 +31,6 @@ Install dependencies (run as root)
     export GOVERSION=1.15.8
     mkdir /tmp/golang;
     pushd; cd /tmp/golang;
-    wget https://dl.google.com/go/go$\{GOVERSION\}.linux-amd64.tar.gz
     wget https://dl.google.com/go/go${GOVERSION}.linux-amd64.tar.gz
     tar -xzf go${GOVERSION}.linux-amd64.tar.gz
     mv go /usr/local/go${GOVERSION}
