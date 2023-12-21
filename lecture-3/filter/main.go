@@ -1,11 +1,11 @@
 package main
 
 import (
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
 	"net"
-	"net/netip"
 	"os"
 	"unsafe"
 
@@ -15,15 +15,10 @@ import (
 const MAXLEN = 2000
 
 // ifindex,mac address mapping for the interfaces
-type entryMacMap struct {
+type entry struct {
 	ifIdx uint32
 	mac   net.HardwareAddr
-}
-
-// ifindex,mac address mapping for the interfaces
-type entryIpMap struct {
-	ifIdx uint32
-	ip    net.IP
+	ip    uint32
 }
 
 // cntPkt resembles cntPkt in ebpf kernel code
@@ -37,8 +32,24 @@ type statEntry struct {
 	count cntPkt
 }
 
+func Ip2long(ipAddr string) (uint32, error) {
+	ip := net.ParseIP(ipAddr)
+	if ip == nil {
+		return 0, errors.New("wrong ipAddr format")
+	}
+	ip = ip.To4()
+	return binary.LittleEndian.Uint32(ip), nil
+}
+
+func Long2ip(ipLong uint32) string {
+	ipByte := make([]byte, 4)
+	binary.LittleEndian.PutUint32(ipByte, ipLong)
+	ip := net.IP(ipByte)
+	return ip.String()
+}
+
 func initializeStatsMap(m *ebpf.Map, entries []uint32) error {
-	fmt.Printf("initStatsMap : Info: %v keysize: %v valueSize: %v\n", m.String(), m.KeySize(), m.ValueSize())
+	fmt.Printf("initStatsMap : Info: %v keysize: %v valueSize: %v", m.String(), m.KeySize(), m.ValueSize())
 	for _, entry := range entries {
 		cntPkt := cntPkt{drop: 0, pass: 0}
 		err := m.Put(entry, (cntPkt))
@@ -50,33 +61,26 @@ func initializeStatsMap(m *ebpf.Map, entries []uint32) error {
 	return nil
 }
 
-func makeMACEntry(ifIdx uint32, mac net.HardwareAddr) *entryMacMap {
-	var en entryMacMap
+func makeEntry(ifIdx uint32, mac net.HardwareAddr, ip uint32) *entry {
+	var en entry
 	en.ifIdx = ifIdx
 	en.mac = mac
-	fmt.Printf("created an entry with id %d, mac %s\n", ifIdx, mac)
-	return &en
-}
-
-func makeIPEntry(ifIdx uint32, ip net.IP) *entryIpMap {
-	var en entryIpMap
-	en.ifIdx = ifIdx
 	en.ip = ip
-	fmt.Printf("created an entry with id %d, ip %s\n", ifIdx, ip)
+	fmt.Printf("created an entry with id %v, mac %s, ip %v\n", ifIdx, mac, ip)
 	return &en
 }
 
 func getInterface(idx int) (*net.Interface, error) {
 	ifa, err := net.InterfaceByIndex(idx)
 	if err != nil {
-		fmt.Printf("Error: %v\n", err.Error())
+		fmt.Printf("Error: %v", err.Error())
 		return nil, err
 	}
 	return ifa, nil
 }
 
 // This will overwrite previous entry if any
-func addEntryMacMap(m *ebpf.Map, entries []entryMacMap, rand int) error {
+func addEntryMacMap(m *ebpf.Map, entries []entry, rand int) error {
 	for _, ifa := range entries {
 		err := m.Put(ifa.ifIdx+uint32(rand), []byte(ifa.mac))
 		if err != nil {
@@ -88,15 +92,9 @@ func addEntryMacMap(m *ebpf.Map, entries []entryMacMap, rand int) error {
 }
 
 // This will overwrite previous entry if any
-func addEntryIpMap(m *ebpf.Map, entries []entryIpMap, rand int) error {
+func addEntryIpMap(m *ebpf.Map, entries []entry, rand int) error {
 	for _, ifa := range entries {
-		ipadr, ok := netip.AddrFromSlice([]byte(ifa.ip))
-		if !ok {
-			fmt.Printf("Error ip conv")
-			return nil
-		}
-		ipnum := ipadr.As4()
-		err := m.Put(ifa.ifIdx+uint32(rand), ipnum)
+		err := m.Put(ifa.ifIdx+uint32(rand), ifa.ip)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
 			return err
@@ -174,60 +172,73 @@ func main() {
 
 	var mode string
 	var idx int
-	var arg_mac string
+	var pod_mac string
+	var pod_ip uint32
 	var arg_ip string
 
 	flag.StringVar(&mode, "mode", "invalid", "Mode can be add")
 	flag.IntVar(&idx, "idx", 0, "iface index where tc hook is attached")
-	flag.StringVar(&arg_mac, "mac", "invalid", "MAC address which is allowed to pass through idx")
-	flag.StringVar(&arg_ip, "ip", "invalid", "IP address which is allowed to pass through idx")
+	flag.StringVar(&pod_mac, "pod_mac", "invalid", "MAC address which is allowed to pass through idx")
+	flag.StringVar(&arg_ip, "pod_ip", "invalid", "IP address of pod which is allowed to pass through idx")
 
 	flag.Parse()
-	fmt.Printf("Mode: %v idx: %v", mode, idx)
+	fmt.Printf("Arguments - mode: %v idx: %v pod_mac: %v pod_ip: %v\n", mode, idx, pod_mac, arg_ip)
 
-	mapPathDir := "/sys/fs/bpf/tc/globals/"
-
-	ifaceMacMapPath := "/sys/fs/bpf/tc/globals/iface_map"
-	ifaceIpMapPath := "/sys/fs/bpf/tc/globals/iface_ip_map"
-	egressCountMapPath := "/sys/fs/bpf/tc/globals/egress_iface_stat_map"
-	ingressCountMapPath := "/sys/fs/bpf/tc/globals/ingress_iface_stat_map"
-
-	var mac_map *ebpf.Map
-	var ip_map *ebpf.Map
-	var m *ebpf.Map
-	var ingress_stats_map *ebpf.Map
-	var egress_stats_map *ebpf.Map
-
-	var en entryMacMap
-	var ct cntPkt
-
-	err := os.MkdirAll(mapPathDir, os.ModePerm)
+	pod_ip, err := Ip2long(arg_ip)
 	if err != nil {
-		fmt.Printf("Error while creating the directory %s\n", err)
+		fmt.Printf("Error while converting %s to ip address", arg_ip)
+		fmt.Println(err)
 		return
 	}
 
+	mapPathDir := "/sys/fs/bpf/tc/globals/"
+	ifaceMacMapPath := "/sys/fs/bpf/tc/globals/iface_map"
+	ifaceIpMapPath := "/sys/fs/bpf/tc/globals/iface_ip_map"
+	countMapPath := "/sys/fs/bpf/tc/globals/iface_stat_map"
+
+	var ip_map *ebpf.Map
+	var mac_map *ebpf.Map
+	var m *ebpf.Map
+	var stats_map *ebpf.Map
+
+	var en entry
+	var ct cntPkt
+	err = os.MkdirAll(mapPathDir, os.ModePerm)
+	if err != nil {
+		fmt.Printf("Error while creating the directory %s", err)
+		return
+	}
+
+	mac_map, err = createArray(MAXLEN,
+		//len(macArr),
+		int(unsafe.Sizeof(en.ifIdx)),
+		//int(unsafe.Sizeof(en.mac)))
+		6)
+	if err != nil {
+		fmt.Printf("Create Map returned error %s\n", err)
+		return
+	}
 	mac_map, err = pinOrGetMap(ifaceMacMapPath, mac_map)
 	if err != nil {
 		fmt.Printf("Error! create map: %s\n", err)
 		return
 	}
 
+	ip_map, err = createArray(MAXLEN,
+		int(unsafe.Sizeof(en.ifIdx)),
+		4)
+	if err != nil {
+		fmt.Printf("Create Map returned error %s\n", err)
+		return
+	}
 	ip_map, err = pinOrGetMap(ifaceIpMapPath, ip_map)
 	if err != nil {
 		fmt.Printf("Error! create map: %s\n", err)
 		return
 	}
 
-	egress_stats_map, err = createArray(MAXLEN, int(unsafe.Sizeof(en.ifIdx)), int(unsafe.Sizeof(ct)))
-	egress_stats_map, err = pinOrGetMap(egressCountMapPath, egress_stats_map)
-	if err != nil {
-		fmt.Printf("Error! create map: %s\n", err)
-		return
-	}
-
-	ingress_stats_map, err = createArray(MAXLEN, int(unsafe.Sizeof(en.ifIdx)), int(unsafe.Sizeof(ct)))
-	ingress_stats_map, err = pinOrGetMap(ingressCountMapPath, ingress_stats_map)
+	stats_map, err = createArray(MAXLEN, int(unsafe.Sizeof(en.ifIdx)), int(unsafe.Sizeof(ct)))
+	stats_map, err = pinOrGetMap(countMapPath, stats_map)
 	if err != nil {
 		fmt.Printf("Error! create map: %s\n", err)
 		return
@@ -240,50 +251,35 @@ func main() {
 			fmt.Printf("Could not get interface %v\n", err.Error())
 			os.Exit(1)
 		}
-		entries := []entryMacMap{}
+		entries := []entry{}
 
-		hwa, err := net.ParseMAC(arg_mac)
+		hwa, err := net.ParseMAC(pod_mac)
 		if err != nil {
 			hwa = ifa.HardwareAddr
 		}
-		e := makeMACEntry(uint32(ifa.Index), hwa)
+		e := makeEntry(uint32(ifa.Index), hwa, pod_ip)
 		entries = append(entries, *e)
 		err = addEntryMacMap(mac_map, entries, 0)
 		if err != nil {
-			fmt.Printf("Error! populating mac map: %s\n", err)
+			fmt.Printf("Error! populating map: %s\n", err)
 			return
 		}
-
-		ip := net.ParseIP((arg_ip))
-		if ip == nil {
-			fmt.Printf("Error parsing ip\n")
-			return
-		}
-
-		ip_entries := []entryIpMap{}
-		ip_entry := makeIPEntry(uint32(ifa.Index), ip)
-		ip_entries = append(ip_entries, *ip_entry)
-		err = addEntryIpMap(ip_map, ip_entries, 0)
+		err = addEntryIpMap(ip_map, entries, 0)
 		if err != nil {
-			fmt.Printf("Error! populating ip map: %s\n", err)
+			fmt.Printf("Error! populating map: %s\n", err)
 			return
 		}
 
 		//Initialize stats maps for idx
 		cntPkt := cntPkt{drop: 0, pass: 0}
-		err = ingress_stats_map.Put(uint32(ifa.Index), (cntPkt))
-		if err != nil {
-			fmt.Printf("Error: %v\n", err)
-			return
-		}
-		err = egress_stats_map.Put(uint32(ifa.Index), (cntPkt))
+		err = stats_map.Put(uint32(ifa.Index), (cntPkt))
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
 			return
 		}
 	default:
-		fmt.Printf("Mode %v not found\n", mode)
-		fmt.Printf("Did you mean?\n ./bin/main --mode add --idx {iface_id} --mac {iface_mac} --ip {iface_ip}\n")
+		fmt.Printf("Mode is invalid")
+		return
 	}
 
 	err = closeMap(m)
